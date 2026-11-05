@@ -1,0 +1,715 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Pup Pause Puppets</title>
+<script src="https://cdn.jsdelivr.net/npm/p5@1.9.4/lib/p5.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/p5play@3.22.6/planck.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/p5play@3.22.6/p5play.min.js"></script>
+<script src="https://unpkg.com/ml5@1/dist/ml5.min.js"></script>
+<style>
+  :root { --paper:#f6f4f0; --ink:#2b2724; --line:#d9d4cc; --gold:#d9b45f; --red:#c8574a; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--paper); color:var(--ink); font:15px/1.4 -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+  main { max-width:832px; margin:0 auto; padding:16px; }
+  h1 { font-size:20px; margin:4px 0 2px; font-weight:600; }
+  .sub { margin:0 0 12px; color:#6b645d; font-size:13px; }
+  #stage canvas { display:block; width:100% !important; height:auto !important; border-radius:12px; border:1px solid var(--line); }
+  .bar { display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin-top:12px; }
+  button { font:inherit; border:1px solid var(--line); background:#fff; color:var(--ink); padding:8px 14px; border-radius:999px; cursor:pointer; }
+  button:hover { border-color:var(--ink); }
+  button:disabled { opacity:.5; cursor:default; }
+  #rec { background:var(--ink); color:#fff; border-color:var(--ink); font-weight:600; }
+  #rec.on { background:var(--red); border-color:var(--red); }
+  #timer { font-variant-numeric:tabular-nums; min-width:40px; }
+  .spacer { flex:1; }
+  label { display:flex; gap:6px; align-items:center; font-size:14px; }
+  #result { margin-top:16px; padding:12px; border:1px solid var(--line); border-radius:12px; background:#fff; }
+  #result video { width:100%; border-radius:8px; background:#000; }
+  #share { background:var(--gold); border-color:var(--gold); font-weight:600; }
+  #msg { font-size:13px; color:#6b645d; min-height:1em; margin:8px 0 0; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Pup Pause Puppets</h1>
+  <p class="sub">Hold up one hand per pup, fingers pointing down like marionette strings. Click a pup to change its outfit.</p>
+  <div id="stage"></div>
+  <div class="bar">
+    <button id="outfitA">Left pup outfit</button>
+    <button id="outfitB">Right pup outfit</button>
+    <span class="spacer"></span>
+    <label><input type="checkbox" id="mic" checked> Record sound</label>
+    <button id="rec">● Record</button>
+    <span id="timer">0:00</span>
+  </div>
+  <p id="msg"></p>
+  <section id="result" hidden>
+    <video id="preview" controls playsinline></video>
+    <div class="bar">
+      <button id="share">Share</button>
+      <button id="download">Download</button>
+      <button id="again">Record again</button>
+    </div>
+  </section>
+</main>
+<script>
+// Pup Pause marionettes — two hand-tracked puppets of the OSA Pup Pause dog
+// Based on the ml5 handPose + p5play puppet sketch (MIT, (c) 2024 ml5)
+// https://opensource.org/licenses/MIT
+// Controls: one hand per pup. Middle finger -> head, index + ring -> front paws,
+// thumb + pinky -> back legs. Click a pup (or keys 1-4 / 5-8) to change outfits.
+
+// ---------- The pup's looks (taken from the watercolor paintings) ----------
+const INK = '#2b2724';
+const LOOKS = [
+  { // 1 — classic: silver fur, gold collar, grey stripes
+    fur: '#bcb7b0', furDark: '#a39d95', face: '#e9e7e3',
+    earInner: '#a9b1be', collar: '#d9b45f', tag: '#f3e7c4',
+    sweater: true, stripeA: '#f4f3f0', stripeB: '#9d9ea4',
+    blush: false, accessory: 'none'
+  },
+  { // 2 — golden: rosy fur, gold ears, brown stripes
+    fur: '#cbbab0', furDark: '#b29f93', face: '#ece6e1',
+    earInner: '#c9a24a', collar: '#d6a83a', tag: '#8a6a2e',
+    sweater: true, stripeA: '#f6f3ef', stripeB: '#8b7563',
+    blush: false, accessory: 'none'
+  },
+  { // 3 — party: lilac + lime, party hat
+    fur: '#a59c94', furDark: '#8f857c', face: '#e4e0dc',
+    earInner: '#ddd3e8', collar: '#cdc1de', tag: '#d9df8f',
+    sweater: true, stripeA: '#e9e2f0', stripeB: '#cfdc8a',
+    blush: false, accessory: 'partyHat'
+  },
+  { // 4 — ducky: blue ears + collar, little duck on top
+    fur: '#aba395', furDark: '#958c7d', face: '#efede9',
+    earInner: '#8fa6d8', collar: '#a9badf', tag: '#dfe6f5',
+    sweater: false, stripeA: '#f4f3f0', stripeB: '#9d9ea4',
+    blush: true, accessory: 'duck'
+  }
+];
+let look = LOOKS[0];
+
+// Little ink mice along the floor: [x as fraction of width, size]
+const MICE = [[0.05, 1], [0.13, 0.85], [0.22, 1.1], [0.30, 0.8],
+              [0.70, 0.85], [0.79, 1], [0.90, 0.9]];
+
+// ---------- Two-pup marionette show ----------
+// Left hand drives the left pup, right hand drives the right pup.
+// With one hand up, it picks up whichever pup is closer.
+
+let handpose, video, hands = [];
+let options = { maxHands: 2, flipHorizontal: true, runtime: "mediapipe" };
+let xMax = 800;
+let yMax = 600;
+let yGap = 150;          // puppet hangs this far below the hand
+let paperWash = 70;      // 0–255 white wash over the webcam
+let stringColor = 'rgba(255,255,255,0.85)';
+let pups = [];
+let pieces, box;
+
+// Each pup: x position (fraction of width), size, starting outfit
+const PUP_SETUP = [
+  { x: 0.30, scale: 0.72, lookIndex: 0 },  // big classic pup
+  { x: 0.70, scale: 0.60, lookIndex: 3 }   // smaller ducky pup
+];
+
+function preload() {
+  handpose = ml5.handPose(options);
+}
+
+function setup() {
+  let c = createCanvas(xMax, yMax);
+  c.parent('stage');
+  rectMode(CORNER);
+  world.gravity.y = 20;
+  video = createCapture(VIDEO);
+  video.size(xMax, yMax);
+  video.hide();
+  handpose.detectStart(video, gotHands);
+
+  pieces = new Group();
+  pieces.overlaps(pieces);
+  pieces.drag = 1;
+
+  PUP_SETUP.forEach((cfg, i) => pups.push(makePuppet(cfg.x * xMax, cfg.scale, cfg.lookIndex, i * 10)));
+
+  box = new Sprite([[1, 1], [xMax, 1], [xMax, yMax], [1, yMax], [1, 1]]);
+  box.collider = "static";
+  box.shape = "chain";
+  box.visible = false;
+
+  setupUI();
+}
+
+function draw() {
+  showVideo();
+  look = pups[0].look;
+  drawMice();
+  assignHands();
+  stroke(stringColor);
+  strokeWeight(1);
+  for (let p of pups) {
+    if (p.hand) movePuppet(p, p.hand);
+    else idlePuppet(p);
+    correctJointAngles(p);
+  }
+}
+
+function gotHands(results) {
+  hands = results;
+}
+
+function assignHands() {
+  for (let p of pups) p.hand = null;
+  if (hands.length >= 2) {
+    let hs = [...hands].sort((a, b) => a.keypoints[0].x - b.keypoints[0].x);
+    pups[0].hand = hs[0];
+    pups[1].hand = hs[1];
+  } else if (hands.length == 1) {
+    let wx = hands[0].keypoints[0].x;
+    let closest = pups.reduce((a, b) => abs(a.head.x - wx) <= abs(b.head.x - wx) ? a : b);
+    closest.hand = hands[0];
+  }
+}
+
+function movePuppet(p, hand) {
+  let left = hand.handedness == 'Left';
+  let k = hand.keypoints;
+  let pull = (sprite, pt, extra, speed) => {
+    sprite.moveTowards(pt.x, pt.y + yGap + extra, speed);
+    line(sprite.x, sprite.y, pt.x, pt.y);
+  };
+  pull(p.head, k[12], 0, 0.5);                                // middle finger -> head
+  pull(p.leftLowerArm, left ? k[16] : k[8], 0, 0.5);          // index / ring -> front paws
+  pull(p.rightLowerArm, left ? k[8] : k[16], 0, 0.5);
+  pull(p.leftKneeHingeB, left ? k[20] : k[4], p.kneeOffset, 1); // thumb / pinky -> back legs
+  pull(p.rightKneeHingeB, left ? k[4] : k[20], p.kneeOffset, 1);
+}
+
+// With no hand on it, a pup hangs calmly in its own spot, feet just above the floor,
+// swaying a little on strings from the top of the frame.
+function idlePuppet(p) {
+  const S = p.S;
+  const cy = yMax - 170 * S - 18;               // body centre so paws rest near the floor
+  const sway = sin(frameCount * 1.2 + p.phase) * 6 * S;
+  const x = p.homeX + sway;
+  const hold = (sprite, tx, ty, speed) => {
+    sprite.moveTowards(tx, ty, speed);
+    line(sprite.x, sprite.y, sprite.x - sway * 0.5, 0);
+  };
+  hold(p.head, x, cy - 85 * S, 0.15);
+  hold(p.leftLowerArm, x - 24 * S, cy + 64 * S, 0.15);
+  hold(p.rightLowerArm, x + 24 * S, cy + 64 * S, 0.15);
+  hold(p.leftKneeHingeB, x - 22 * S, cy + 108 * S, 0.3);
+  hold(p.rightKneeHingeB, x + 22 * S, cy + 108 * S, 0.3);
+}
+
+function showVideo() {
+  background(255);
+  push();
+  if (options.flipHorizontal) { translate(width, 0); scale(-1, 1); }
+  image(video, 0, 0, width, height);
+  pop();
+  noStroke();
+  fill(246, 244, 240, paperWash);
+  rect(0, 0, width, height);
+}
+
+function nearestPupX(x) {
+  if (!pups.length) return x;
+  return pups.reduce((a, b) => abs(a.head.x - x) <= abs(b.head.x - x) ? a : b).head.x;
+}
+
+function cycleOutfit(i) {
+  let p = pups[i];
+  p.lookIndex = (p.lookIndex + 1) % LOOKS.length;
+  p.look = LOOKS[p.lookIndex];
+}
+
+function mousePressed() {
+  // Click a pup to change its outfit
+  for (let i = 0; i < pups.length; i++) {
+    if (dist(mouseX, mouseY, pups[i].head.x, pups[i].head.y) < 80 * pups[i].S) { cycleOutfit(i); return; }
+  }
+}
+
+function keyPressed() {
+  let n = parseInt(key);
+  if (n >= 1 && n <= 4) { pups[0].lookIndex = n - 1; pups[0].look = LOOKS[n - 1]; }
+  if (n >= 5 && n <= 8) { pups[1].lookIndex = n - 5; pups[1].look = LOOKS[n - 5]; }
+}
+
+// ---------- Building one puppet ----------
+
+function makePuppet(cx, S, lookIndex, layerBase) {
+  const cy = yMax / 2;
+  const p = { S, lookIndex, look: LOOKS[lookIndex], kneeOffset: 193 * S, hand: null, homeX: cx, phase: random(360) };
+
+  const glue = (a, b) => { let j = new GlueJoint(a, b); j.visible = false; };
+  const hinge = (a, b) => { let j = new HingeJoint(a, b); j.visible = false; };
+  const pin = (x, y) => {
+    let s = new pieces.Sprite();
+    s.diameter = S * 20; s.x = x; s.y = y; s.visible = false;
+    return s;
+  };
+  const part = (w, h, x, y, layer, drawFn) => {
+    let s = new pieces.Sprite();
+    s.width = w; s.height = h; s.x = x; s.y = y;
+    s.layer = layerBase + layer;
+    if (drawFn) s.draw = () => { look = p.look; rectMode(CORNER); drawFn(w, h); };
+    else s.visible = false;
+    return s;
+  };
+  // A hinged limb: pin on `parent` at (px,py), limb sprite glued to the other pin
+  const joinAt = (parent, child, px, py) => {
+    let a = pin(px, py); glue(a, parent);
+    let b = pin(px, py); glue(b, child);
+    hinge(a, b);
+    return b;
+  };
+
+  const shoulders = part(S * 70, S * 18, cx, cy, 1);
+  const neck = part(S * 22, S * 30, cx, cy - S * 22, 4, drawNeck);
+  glue(neck, shoulders);
+
+  const head = new pieces.Sprite();
+  head.diameter = S * 140;
+  head.x = cx; head.y = cy - S * 85;
+  head.layer = layerBase + 6;
+  head.draw = () => { look = p.look; rectMode(CORNER); drawHead(S * 70); };
+  glue(neck, head);
+  p.head = head;
+
+  const torso = part(S * 60, S * 75, cx, cy + S * 32, 4, drawTorso);
+  glue(torso, shoulders);
+  const hips = part(S * 70, S * 18, cx, cy + S * 62, 1);
+  glue(torso, hips);
+
+  const tail = part(S * 60, S * 12, cx - S * 58, cy + S * 66, 1, drawTail);
+  joinAt(hips, tail, cx - S * 30, cy + S * 66);
+
+  for (let side of [-1, 1]) {
+    const nm = side < 0 ? 'left' : 'right';
+    const ax = cx + side * S * 24;
+    // Front leg
+    const upper = part(S * 18, S * 40, ax, cy + S * 24, 5, drawUpperLeg);
+    joinAt(shoulders, upper, ax, cy + S * 4);
+    const lower = part(S * 18, S * 40, ax, cy + S * 64, 5, drawFrontPaw);
+    joinAt(upper, lower, ax, cy + S * 44);
+    p[nm + 'UpperArm'] = upper;
+    p[nm + 'LowerArm'] = lower;
+
+    // Back leg
+    const lx = cx + side * S * 22;
+    const thigh = part(S * 26, S * 46, lx, cy + S * 85, 2, drawThigh);
+    joinAt(hips, thigh, lx, cy + S * 62);
+    const shin = part(S * 22, S * 40, lx, cy + S * 128, 2, drawLowerLeg);
+    p[nm + 'KneeHingeB'] = joinAt(thigh, shin, lx, cy + S * 108);
+    const foot = part(S * 36, S * 16, cx + side * S * 26, cy + S * 150, 3, drawBackPaw);
+    glue(foot, shin);
+    foot.collides(thigh);   // stop the leg over-swinging
+    p[nm + 'Thigh'] = thigh;
+    p[nm + 'LowerLeg'] = shin;
+  }
+  return p;
+}
+
+// Keep elbows and knees bending the right way
+function correctJointAngles(p) {
+  const bend = (a, b) => Math.round((((a.rotation - b.rotation) % 360) + 360) % 360);
+  if (bend(p.leftThigh, p.leftLowerLeg) > 180) p.leftLowerLeg.rotate(-5, 30);
+  if (bend(p.rightLowerLeg, p.rightThigh) > 180) p.rightLowerLeg.rotate(5, 30);
+  if (bend(p.leftLowerArm, p.leftUpperArm) > 180) p.leftLowerArm.rotate(5, 30);
+  if (bend(p.rightUpperArm, p.rightLowerArm) > 180) p.rightLowerArm.rotate(-5, 30);
+}
+
+// ---------- Recording, download and share ----------
+
+let recorder = null, chunks = [], micStream = null, recStart = 0, timerId = null;
+let lastBlob = null, lastExt = 'webm';
+const $ = id => document.getElementById(id);
+
+function setupUI() {
+  $('outfitA').onclick = () => cycleOutfit(0);
+  $('outfitB').onclick = () => cycleOutfit(1);
+  $('rec').onclick = () => recorder ? stopRec() : startRec();
+  $('download').onclick = downloadVideo;
+  $('share').onclick = shareVideo;
+  $('again').onclick = () => { $('result').hidden = true; setMsg(''); };
+  if (!window.MediaRecorder) {
+    $('rec').disabled = true;
+    setMsg('This browser can\'t record video. Try Chrome or Safari.');
+  }
+}
+
+function setMsg(t) { $('msg').textContent = t; }
+
+function pickMime() {
+  const types = [
+    'video/mp4;codecs=avc1.42E01E,mp4a.40.2',
+    'video/mp4',
+    'video/webm;codecs=vp9,opus',
+    'video/webm;codecs=vp8,opus',
+    'video/webm'
+  ];
+  return types.find(t => MediaRecorder.isTypeSupported(t)) || '';
+}
+
+async function startRec() {
+  setMsg('');
+  $('result').hidden = true;
+  const canvasEl = document.querySelector('#stage canvas');
+  const tracks = [...canvasEl.captureStream(30).getVideoTracks()];
+  if ($('mic').checked) {
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      tracks.push(...micStream.getAudioTracks());
+    } catch (e) {
+      setMsg('Microphone was blocked, so this take has no sound.');
+    }
+  }
+  const mime = pickMime();
+  recorder = new MediaRecorder(new MediaStream(tracks), mime ? { mimeType: mime, videoBitsPerSecond: 5000000 } : {});
+  chunks = [];
+  recorder.ondataavailable = e => { if (e.data && e.data.size) chunks.push(e.data); };
+  recorder.onstop = finishRec;
+  recorder.start();   // one clean file on stop (timeslice chunks can arrive out of order)
+  recStart = Date.now();
+  $('rec').textContent = '■ Stop';
+  $('rec').classList.add('on');
+  timerId = setInterval(updateTimer, 250);
+  updateTimer();
+}
+
+function stopRec() {
+  if (recorder && recorder.state != 'inactive') recorder.stop();
+}
+
+function updateTimer() {
+  let s = Math.floor((Date.now() - recStart) / 1000);
+  $('timer').textContent = Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0');
+}
+
+function finishRec() {
+  clearInterval(timerId);
+  const type = (recorder.mimeType || 'video/webm').split(';')[0];
+  lastBlob = new Blob(chunks, { type });
+  lastExt = type.includes('mp4') ? 'mp4' : 'webm';
+  if (micStream) micStream.getTracks().forEach(t => t.stop());
+  micStream = null;
+  recorder = null;
+  $('rec').textContent = '● Record';
+  $('rec').classList.remove('on');
+  $('preview').src = URL.createObjectURL(lastBlob);
+  $('result').hidden = false;
+}
+
+function fileName() {
+  const d = new Date();
+  const stamp = d.toISOString().slice(0, 16).replace(/[:T]/g, '-');
+  return 'pup-pause-' + stamp + '.' + lastExt;
+}
+
+function downloadVideo() {
+  if (!lastBlob) return;
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(lastBlob);
+  a.download = fileName();
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function shareVideo() {
+  if (!lastBlob) return;
+  const file = new File([lastBlob], fileName(), { type: lastBlob.type });
+  if (navigator.canShare && navigator.canShare({ files: [file] })) {
+    try {
+      await navigator.share({ files: [file], title: 'Pup Pause', text: 'A little Pup Pause puppet show 🐾' });
+    } catch (e) {
+      if (e.name != 'AbortError') setMsg('Sharing didn\'t work: ' + e.message);
+    }
+  } else {
+    downloadVideo();
+    setMsg('This browser can\'t share files directly, so the video was downloaded instead. You can attach it to a message or post from there.');
+  }
+}
+
+// ---------- Drawing the pup (all in each sprite's local coordinates) ----------
+
+function inkStroke(w = 1.3) { stroke(INK); strokeWeight(w); strokeJoin(ROUND); }
+
+function drawEar(R, side) {
+  push();
+  scale(side, 1);
+  translate(-0.55 * R, -0.3 * R);
+  rotate(-34);  // p5play uses degrees
+  inkStroke();
+  fill(look.fur);
+  beginShape();
+  vertex(-0.5 * R, 0.2 * R);
+  bezierVertex(-0.85 * R, -0.75 * R, -0.35 * R, -1.45 * R, 0.05 * R, -1.9 * R);
+  bezierVertex(0.38 * R, -1.25 * R, 0.62 * R, -0.55 * R, 0.5 * R, 0.2 * R);
+  endShape(CLOSE);
+  // Soft darker wash along the outer edge, like the paintings
+  noStroke();
+  fill(look.furDark + '66');
+  beginShape();
+  vertex(-0.5 * R, 0.2 * R);
+  bezierVertex(-0.85 * R, -0.75 * R, -0.35 * R, -1.45 * R, 0.05 * R, -1.9 * R);
+  bezierVertex(-0.2 * R, -1.25 * R, -0.5 * R, -0.6 * R, -0.3 * R, 0.2 * R);
+  endShape(CLOSE);
+  // Inner ear
+  inkStroke(1);
+  fill(look.earInner);
+  beginShape();
+  vertex(-0.24 * R, -0.12 * R);
+  bezierVertex(-0.5 * R, -0.75 * R, -0.2 * R, -1.2 * R, 0.03 * R, -1.5 * R);
+  bezierVertex(0.2 * R, -1.0 * R, 0.36 * R, -0.55 * R, 0.24 * R, -0.12 * R);
+  endShape(CLOSE);
+  pop();
+}
+
+function drawHead(R) {
+  drawEar(R, 1);
+  drawEar(R, -1);
+
+  // Skull + muzzle: outline pass, then a fill pass to hide inner lines
+  inkStroke();
+  fill(look.fur);
+  ellipse(0, -0.08 * R, 2.0 * R, 1.72 * R);
+  ellipse(0, 0.42 * R, 1.2 * R, 0.9 * R);
+  noStroke();
+  ellipse(0, -0.08 * R, 2.0 * R - 2, 1.72 * R - 2);
+  ellipse(0, 0.42 * R, 1.2 * R - 2, 0.9 * R - 2);
+
+  // Darker cap on top of the head
+  fill(look.furDark + '55');
+  ellipse(0, -0.4 * R, 1.6 * R, 0.9 * R);
+
+  // Light face mask and muzzle
+  fill(look.face);
+  ellipse(0, 0.05 * R, 1.0 * R, 1.05 * R);
+  fill(look.face + 'cc');
+  ellipse(0, 0.45 * R, 0.95 * R, 0.62 * R);
+
+  if (look.blush) {
+    fill(240, 165, 155, 110);
+    ellipse(-0.36 * R, 0.42 * R, 0.24 * R, 0.14 * R);
+    ellipse(0.36 * R, 0.42 * R, 0.24 * R, 0.14 * R);
+  }
+
+  // Eyes
+  fill(INK);
+  ellipse(-0.3 * R, 0.12 * R, 0.14 * R, 0.14 * R);
+  ellipse(0.3 * R, 0.12 * R, 0.14 * R, 0.14 * R);
+
+  // Nose
+  inkStroke(1.5);
+  fill(INK);
+  beginShape();
+  vertex(-0.11 * R, 0.37 * R);
+  vertex(0.11 * R, 0.37 * R);
+  vertex(0, 0.48 * R);
+  endShape(CLOSE);
+
+  // Freckles
+  strokeWeight(2);
+  for (let s of [-1, 1]) {
+    point(s * 0.22 * R, 0.52 * R);
+    point(s * 0.29 * R, 0.56 * R);
+    point(s * 0.2 * R, 0.6 * R);
+  }
+
+  // Whiskers
+  strokeWeight(0.8);
+  for (let s of [-1, 1]) {
+    for (let k = 0; k < 3; k++) {
+      line(s * 0.3 * R, (0.5 + k * 0.05) * R, s * 1.0 * R, (0.36 + k * 0.13) * R);
+    }
+  }
+
+  if (look.accessory == 'partyHat') drawPartyHat(R);
+  if (look.accessory == 'duck') drawDuck(R);
+}
+
+function drawPartyHat(R) {
+  push();
+  translate(0, -0.9 * R);
+  scale(1.6);
+  // Pompom
+  noStroke();
+  for (let i = 0; i < 9; i++) {
+    let a = i * 40;
+    fill(i % 2 ? '#c9d86a' : '#a8c24d');
+    ellipse(cos(a) * 0.1 * R, -0.62 * R + sin(a) * 0.08 * R, 0.16 * R, 0.13 * R);
+  }
+  // Cone
+  inkStroke(1.1);
+  fill('#dfe4a8');
+  triangle(-0.26 * R, 0, 0.26 * R, 0, 0, -0.58 * R);
+  noFill();
+  strokeWeight(0.9);
+  for (let [x, y] of [[-0.1, -0.1], [0.06, -0.14], [-0.02, -0.28], [0.12, -0.04], [0.02, -0.42], [-0.16, -0.03]]) {
+    ellipse(x * R, y * R, 0.06 * R, 0.06 * R);
+  }
+  pop();
+}
+
+function drawDuck(R) {
+  push();
+  translate(0, -0.88 * R);
+  scale(1.7);
+  inkStroke(1.1);
+  fill('#f2dc6b');
+  ellipse(0, -0.05 * R, 0.34 * R, 0.24 * R);   // body
+  ellipse(0, -0.3 * R, 0.28 * R, 0.28 * R);    // head
+  noStroke();
+  fill(INK);
+  ellipse(-0.05 * R, -0.32 * R, 0.035 * R, 0.035 * R);
+  ellipse(0.05 * R, -0.32 * R, 0.035 * R, 0.035 * R);
+  inkStroke(1);
+  fill('#e8a03c');
+  triangle(-0.07 * R, -0.24 * R, 0.07 * R, -0.24 * R, 0, -0.17 * R); // beak
+  noFill();
+  line(0, -0.44 * R, -0.04 * R, -0.52 * R);   // tuft
+  line(0, -0.44 * R, 0.05 * R, -0.5 * R);
+  pop();
+}
+
+function drawNeck(w, h) {
+  noStroke();
+  fill(look.fur);
+  rect(-w / 2, -h / 2, w, h);
+  inkStroke(1);
+  line(-w / 2, -h / 2, -w / 2, h / 2);
+  line(w / 2, -h / 2, w / 2, h / 2);
+}
+
+function drawTorso(w, h) {
+  inkStroke();
+  if (look.sweater) {
+    fill(look.stripeA);
+    rect(-w / 2, -h / 2, w, h, w * 0.2, w * 0.2, w * 0.3, w * 0.3);
+    // Stripes
+    noStroke();
+    fill(look.stripeB);
+    for (let i = 0; i < 4; i++) {
+      let y = -h / 2 + h * (0.28 + i * 0.18);
+      rect(-w / 2 + 1, y, w - 2, h * 0.08);
+    }
+    inkStroke(0.9);
+    for (let i = 0; i < 4; i++) {
+      let y = -h / 2 + h * (0.28 + i * 0.18);
+      line(-w / 2 + 2, y, w / 2 - 2, y);
+    }
+  } else {
+    fill(look.fur);
+    rect(-w / 2, -h / 2, w, h, w * 0.3);
+    noStroke();
+    fill(look.face + 'cc');
+    ellipse(0, h * 0.05, w * 0.45, h * 0.6);
+  }
+  // Collar + tag
+  inkStroke(1.2);
+  fill(look.collar);
+  rect(-w * 0.4, -h / 2 - h * 0.04, w * 0.8, h * 0.17, 3);
+  fill(look.tag);
+  ellipse(0, -h / 2 + h * 0.045, h * 0.1, h * 0.1);
+}
+
+function drawUpperLeg(w, h) {
+  inkStroke();
+  fill(look.fur);
+  rect(-w / 2, -h / 2, w, h, w * 0.45);
+}
+
+function drawFrontPaw(w, h) {
+  inkStroke();
+  fill(look.fur);
+  rect(-w / 2, -h / 2, w, h, w * 0.45);
+  // Paw
+  ellipse(0, h / 2 - w * 0.2, w * 1.25, w * 0.85);
+  strokeWeight(0.8);
+  line(-w * 0.18, h / 2 - w * 0.05, -w * 0.18, h / 2 + w * 0.15);
+  line(w * 0.18, h / 2 - w * 0.05, w * 0.18, h / 2 + w * 0.15);
+}
+
+function drawThigh(w, h) {
+  inkStroke();
+  fill(look.fur);
+  ellipse(0, 0, w * 1.3, h);
+  noStroke();
+  fill(look.furDark + '55');
+  ellipse(w * 0.1, h * 0.1, w * 0.8, h * 0.6);
+}
+
+function drawLowerLeg(w, h) {
+  inkStroke();
+  fill(look.fur);
+  rect(-w / 2, -h / 2, w, h, w * 0.45);
+}
+
+function drawBackPaw(w, h) {
+  inkStroke();
+  fill(look.fur);
+  ellipse(0, 0, w, h * 1.3);
+  strokeWeight(0.8);
+  line(-w * 0.15, h * 0.05, -w * 0.15, h * 0.6);
+  line(w * 0.15, h * 0.05, w * 0.15, h * 0.6);
+}
+
+function drawTail(w, h) {
+  // Base is at the right end (attached to the hip), tip at the left
+  inkStroke();
+  fill(look.fur);
+  beginShape();
+  vertex(w / 2, -h / 2);
+  quadraticVertex(-w * 0.1, -h * 0.5, -w / 2, 0);
+  quadraticVertex(-w * 0.1, h * 0.3, w / 2, h / 2);
+  endShape(CLOSE);
+}
+
+// ---------- Ink mice along the floor ----------
+
+function drawMice() {
+  let floorY = height - 14;
+  for (let i = 0; i < MICE.length; i++) {
+    let [fx, s] = MICE[i];
+    let x = fx * width;
+    let facing = nearestPupX(x) < x ? -1 : 1;   // they all watch the nearest pup
+    let bob = sin(frameCount * 7 + i * 97) * 1.2;
+    drawMouse(x, floorY + bob, s * 0.9, facing);
+  }
+}
+
+function drawMouse(x, y, s, facing) {
+  push();
+  translate(x, y);
+  scale(facing * s, s);
+  inkStroke(1.1);
+  noFill();
+  // tail squiggle
+  beginShape();
+  curveVertex(-8, 0); curveVertex(-8, 0); curveVertex(-16, -3);
+  curveVertex(-22, 2); curveVertex(-30, -1); curveVertex(-30, -1);
+  endShape();
+  fill(look.fur + 'aa');
+  ellipse(-2, -6, 16, 14);          // body
+  ellipse(8, -14, 11, 10);          // head
+  fill(look.face);
+  ellipse(4, -22, 10, 10);          // ear
+  noFill();
+  line(12, -15, 18, -13);           // snout
+  fill(INK);
+  ellipse(18, -13, 3, 3);           // nose
+  ellipse(10, -15, 1.6, 1.6);       // eye
+  pop();
+}
+
+
+</script>
+</body>
+</html>
